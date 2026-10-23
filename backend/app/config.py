@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
 
     LLM_API_KEY: str = ""
-    LLM_BASE_URL: str = "https://api.agnes-ai.cn/v1"
-    LLM_MODEL: str = "agnes-3.0-flash"
+    LLM_BASE_URL: str = "https://api.deepseek.com/v1"
+    LLM_MODEL: str = "deepseek-chat"
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env", env_file_encoding="utf-8"
