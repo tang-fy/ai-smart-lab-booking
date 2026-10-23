@@ -23,24 +23,52 @@
 | 后端 | Python、FastAPI、SQLAlchemy 2.0、Pydantic v2、Uvicorn |
 | 数据库 | MySQL 8（InnoDB） |
 | 鉴权 | JWT（PyJWT）、bcrypt |
-| AI | LangChain、LangGraph、OpenAI 兼容接口（Agnes）、SSE |
+| AI | LangChain、LangGraph、OpenAI 兼容接口（默认 DeepSeek，可切换任意兼容服务）、SSE |
 | RAG | sentence-transformers `BAAI/bge-small-zh-v1.5` + 本地向量索引（余弦相似度） |
 
 ## 关键设计
 
 ### 并发预约一致性
 
-“先查冲突、再插入”在并发下会双写（两个请求都查不到冲突，然后都插入成功）。本项目做了三层处理：
+“先查冲突、再插入”在并发下会双写（两个请求都查不到冲突，然后都插入成功）。本项目做了四层处理：
 
 1. 创建预约时对**实验室行**（有设备时再加**设备行**）执行 `SELECT ... FOR UPDATE`，把同一资源的写操作串行化
 2. 拿到锁后**再次判定时段交叉**，而不是沿用进入事务前的查询结果
 3. 事务隔离级别设为 `READ COMMITTED`，保证等锁结束后能读到其他事务刚提交的预约（默认的 `REPEATABLE READ` 会在第一次查询时固定快照，等锁后仍然看不到别人的新记录）
 4. `idempotency_key` 唯一索引兜底重复提交，`IntegrityError` 时回查并返回原记录
 
-可复现结果：
+两者职责不同，不能互相替代：唯一索引只能拦住「同一个幂等键」的重复提交，拦不住不同用户对同一时段的交叉预约；行锁串行化的是「冲突判定 + 插入」这段临界区，才是解决时段重叠的手段。
 
-- 20 个并发请求同时提交同一实验室、同一日期与时段：**仅 1 条预约记录落库**，其余 19 个请求返回“该时段已预约”
-- 同一幂等键并发重试 6 次：数据库仍只有 **1 条**记录
+#### 实测结果
+
+压测脚本：[`backend/tests/bench_reservation.py`](backend/tests/bench_reservation.py)，直接调用 `reservation_service.create_reservation`（同一业务代码、同一 MySQL），绕开 HTTP 线程池，单独验证锁与隔离级别。数据库连接上限设为 40，单机 MySQL 8。
+
+| 场景 | 隔离级别 | 并发 | 成功 | 业务拒绝 | 落库 | 行锁等待 | 死锁 | p50 / p95 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 同一实验室同时段、不同幂等键 | READ COMMITTED | 20 | 1 | 19 | 1 | 19 | 0 | 174 / 214 ms |
+| 同一实验室同时段、不同幂等键 | READ COMMITTED | 100 | 1 | 99 | 1 | 99 | 0 | 370 / 635 ms |
+| 同一实验室同时段、不同幂等键 | READ COMMITTED | 500 | 1 | 499 | 1 | 499 | 0 | 1702 / 3016 ms |
+| 同一幂等键并发重试 | READ COMMITTED | 20 | 1（另 19 次返回 `duplicated`） | 0 | 1 | 19 | 0 | 87 / 109 ms |
+| 对照：只靠行锁 + 普通 SELECT | REPEATABLE READ | 20 | 8 | 12 | 8 | 19 | 0 | 289 / 340 ms |
+| 对照：去掉行锁，两事务先查后插 | — | 2 | 两事务均“无冲突” | 0 | 2 | — | — | — |
+
+结论：
+
+- 行锁等待次数恒为 `并发数 - 1`，说明请求确实被串行化在实验室行上；600+ 次尝试死锁增量为 0，`SHOW ENGINE INNODB STATUS` 无 `LATEST DETECTED DEADLOCK`。锁加在主键等值命中且已存在的行上，属于记录锁，不会退化成间隙锁
+- `REPEATABLE READ` 对照组的失败证明：只有行锁不够。事务在等锁前的快照已经固定，等锁期间看不到别人提交的记录，20 并发会落库多条（重复运行在 8~9 条之间波动）
+- 同一幂等键的 20 并发由唯一索引 + `IntegrityError` 回查兜底，最终仍只有 1 条
+- 去掉行锁后两个事务都读到“无冲突”并各自插入，最终落库 2 条，即问题本身
+
+复现：
+
+```bash
+cd backend
+python tests/bench_reservation.py
+```
+
+脚本会自动清理 `idempotency_key` 以 `bench-` 开头的测试数据，可用环境变量 `LAB_ID`、`BENCH_USER_ID`、`BENCH_DATE`、`BENCH_START`、`BENCH_END` 覆盖默认值。
+
+> 上述数字只用于验证并发正确性（不双写），不代表系统吞吐量。压测连接上限为 40，500 并发时 p95 已到 3s，瓶颈在连接排队而非数据库锁本身。
 
 ### 权限边界
 
@@ -85,6 +113,7 @@ lab-agent/
 │   │   └── main.py         # 应用入口
 │   ├── data/kb/            # 知识库 Markdown
 │   ├── uploads/            # 上传文件（运行时生成）
+│   ├── tests/              # 并发一致性压测脚本
 │   └── requirements.txt
 └── frontend/
     ├── src/
@@ -130,10 +159,10 @@ JWT_SECRET_KEY=换成一个足够长的随机字符串
 JWT_EXPIRE_HOURS=24
 JWT_ALGORITHM=HS256
 
-# 大模型（OpenAI 兼容接口）
+# 大模型（OpenAI 兼容接口，默认 DeepSeek，也可换成 Agnes 等）
 LLM_API_KEY=你的APIKey
-LLM_BASE_URL=https://api.agnes-ai.cn/v1
-LLM_MODEL=agnes-3.0-flash
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
 ```
 
 启动：
@@ -180,7 +209,7 @@ UPDATE users SET role = 'admin' WHERE username = '你的账号';
 | 用户 | `GET/PUT /api/user/me`、`PUT /api/user/password`、`GET/POST/PUT/DELETE /api/user` |
 | 实验室 | `GET /api/lab/list`、`GET /api/lab/{id}`、`POST/PUT/DELETE /api/lab` |
 | 设备 | `GET /api/equipment/list`、`POST/PUT/DELETE /api/equipment` |
-| 文件 | `POST /api/file/upload` |
+| 文件 | `POST /api/files/upload` |
 | 预约 | `GET /api/reservation/list`、`POST /api/reservation`、`PUT /api/reservation/{id}/cancel`、`PUT /api/reservation/{id}/audit` |
 | AI | `POST /api/ai/chat`、`POST /api/ai/chat/stream` |
 
@@ -189,7 +218,8 @@ UPDATE users SET role = 'admin' WHERE username = '你的账号';
 ## 已知限制
 
 - RAG 使用本地 numpy 向量索引（余弦相似度）而不是 ChromaDB：本机 chromadb 的 Rust 原生绑定在调用 `count()` 时会触发访问违例，因此替换为等价实现
-- 并发测试验证的是**不会双写**，不代表系统吞吐量
+- 并发测试验证的是**不会双写**，不代表系统吞吐量；脚本直接调用 service 并放宽到 40 个连接，走真实 HTTP 时默认连接池为 `pool_size=5 + max_overflow=10`，数百并发会先报 `QueuePool limit ...`，瓶颈在连接池与工作线程，而不是数据库锁
+- 取消与审核接口未加行锁，属于先读后写；并发下存在状态覆盖窗口，如需严格一致可改为带状态条件的 `UPDATE ... WHERE status = ?` 并检查影响行数
 - 向量模型首次加载较慢；生产环境建议改为独立检索服务
 
 ## License
